@@ -111,8 +111,8 @@ contract PredictionPool is Ownable2Step {
         devFee = config.devFee;
         expectedInitialDeposit = config.initialDeposit;
 
-        uint256 initialPrice = IOracle(config.oracle).readValue();
-        previousPrice = initialPrice == 0 ? 1e18 : initialPrice;
+        // 0 means no baseline yet: rebalance() adopts the first non-zero price.
+        previousPrice = IOracle(config.oracle).readValue();
 
         bullCoin = Coin(
             ICoinFactory(config.coinFactory).createCoin(
@@ -183,7 +183,8 @@ contract PredictionPool is Ownable2Step {
         address previousOracle = address(oracle);
         oracle = IOracle(newOracle);
         uint256 currentPrice = IOracle(newOracle).readValue();
-        if (currentPrice > 0) previousPrice = currentPrice;
+        // A different oracle must not inherit the old oracle's price as its baseline.
+        if (currentPrice > 0 || newOracle != previousOracle) previousPrice = currentPrice;
         emit OracleUpdated(previousOracle, newOracle);
     }
 
