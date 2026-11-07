@@ -2,6 +2,7 @@
 pragma solidity ^0.8.23;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { AccumulatorVault } from "../src/AccumulatorVault.sol";
 import { Coin } from "../src/Coin.sol";
 import { Karma } from "../src/Karma.sol";
@@ -11,39 +12,15 @@ import { PredictionPoolFactory } from "../src/PredictionPoolFactory.sol";
 import { IOracle } from "../src/interfaces/IOracle.sol";
 import { MockBaseToken } from "./mocks/Mocks.sol";
 
-contract FixedOracle is IOracle {
-    uint256 private immutable _value;
-
-    constructor(uint256 value_) {
-        _value = value_;
-    }
-
-    function readValue() external view returns (uint256) {
-        return _value;
-    }
-
-    function readValueInterval() external view returns (uint256, uint256) {
-        return (_value, _value);
-    }
-
-    function lastUpdated() external view returns (uint256) {
-        return block.timestamp;
-    }
-
-    function description() external pure returns (string memory) {
-        return "Fixed oracle";
-    }
-}
-
-contract SettableOracle is IOracle {
+contract MockPriceOracle is IOracle {
     uint256 public value;
 
-    constructor(uint256 value_) {
-        value = value_;
+    constructor(uint256 initialValue) {
+        value = initialValue;
     }
 
-    function set(uint256 value_) external {
-        value = value_;
+    function setValue(uint256 newValue) external {
+        value = newValue;
     }
 
     function readValue() external view returns (uint256) {
@@ -59,52 +36,36 @@ contract SettableOracle is IOracle {
     }
 
     function description() external pure returns (string memory) {
-        return "Settable oracle";
+        return "Test oracle";
     }
 }
 
-// A pool created while its oracle reads 0 (e.g. a Karma with no submissions)
-// must take the first real price as its baseline, not rebalance against a placeholder.
+// A pool whose oracle reads 0 must take the first real price as its baseline.
 contract PoolPriceBaselineTest is Test {
     uint256 private constant INITIAL_DEPOSIT = 1_000e18;
-    uint256 private constant HALF = INITIAL_DEPOSIT / 2;
+    uint256 private constant MINT_FEE = 500;
+    uint256 private constant BURN_FEE = 500;
+    uint256 private constant CREATOR_FEE = 500;
+    uint256 private constant DEV_FEE = 300;
+
+    address private dev = makeAddr("dev");
+    address private receiver = makeAddr("receiver");
+    address private trader = makeAddr("trader");
 
     MockBaseToken private baseToken;
     PredictionPoolFactory private poolFactory;
     PredictionPool private sourcePool;
     Karma private karma;
 
-    address private trader = makeAddr("trader");
-
     function setUp() public {
         baseToken = new MockBaseToken();
-        poolFactory =
-            new PredictionPoolFactory(address(new AccumulatorVault(address(1), address(2))));
+        poolFactory = new PredictionPoolFactory(address(new AccumulatorVault(dev, receiver)));
         baseToken.mint(address(this), 10 * INITIAL_DEPOSIT);
         baseToken.approve(address(poolFactory), type(uint256).max);
 
-        // Source pool gives this contract a balanced 500/500 position to report with.
-        sourcePool = _createPool(address(new FixedOracle(2_500e18)));
+        // The source pool gives this contract a balanced position to submit Karma prices with.
+        sourcePool = _createPool(address(new MockPriceOracle(2_500e18)));
         karma = Karma(new KarmaAdapterFactory().createKarma(address(sourcePool), 0, 0, "Karma"));
-    }
-
-    function _createPool(address oracle) private returns (PredictionPool) {
-        return PredictionPool(
-            poolFactory.createPool(
-                "Pool",
-                address(baseToken),
-                oracle,
-                "Bull",
-                "BULL",
-                "Bear",
-                "BEAR",
-                500,
-                500,
-                500,
-                300,
-                INITIAL_DEPOSIT
-            )
-        );
     }
 
     function test_nonZeroOracleSetsPreviousPrice() public view {
@@ -115,6 +76,8 @@ contract PoolPriceBaselineTest is Test {
         assertEq(karma.readValue(), 0);
         PredictionPool pool = _createPool(address(karma));
         assertEq(pool.previousPrice(), 0);
+        (,,,, uint256 lastPrice) = pool.getPoolStats();
+        assertEq(lastPrice, 0);
     }
 
     function test_firstOraclePriceBecomesBaselineWithoutMovingReserves() public {
@@ -123,8 +86,19 @@ contract PoolPriceBaselineTest is Test {
         karma.submitPrice(2_000e18);
         pool.rebalance();
 
-        assertEq(baseToken.balanceOf(address(pool.bullCoin())), HALF);
-        assertEq(baseToken.balanceOf(address(pool.bearCoin())), HALF);
+        _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
+        assertEq(pool.previousPrice(), 2_000e18);
+    }
+
+    function test_adoptingBaselineEmitsNoEvent() public {
+        PredictionPool pool = _createPool(address(karma));
+        karma.submitPrice(2_000e18);
+
+        vm.recordLogs();
+        pool.rebalance();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(logs.length, 0);
         assertEq(pool.previousPrice(), 2_000e18);
     }
 
@@ -142,30 +116,45 @@ contract PoolPriceBaselineTest is Test {
 
         vm.prank(trader);
         uint256 assetOut = bear.sell(coins);
-        // Mint fees (mint + creator + dev = 1.3%) leave 98.7e18 coins at par; burn fees leave 97.4169e18.
+        // Fees are 1.3% each way: 98.7e18 coins at par, then 97.4169e18 back on sell.
         assertEq(coins, 98.7e18);
         assertEq(assetOut, 97.4169e18);
+        assertEq(pool.previousPrice(), 2_000e18);
     }
 
     function test_priceMovesAfterBaselineStillRebalance() public {
         PredictionPool pool = _createPool(address(karma));
-        address bull = address(pool.bullCoin());
 
         karma.submitPrice(2_000e18);
         pool.rebalance();
-        vm.warp(block.timestamp + 1);
         karma.submitPrice(4_000e18);
         assertEq(karma.readValue(), 4_000e18);
         pool.rebalance();
 
         // Price doubles: bull target = 1000 * 1000 / (1000 + 250) = 800.
-        assertEq(baseToken.balanceOf(bull), 800e18);
+        _assertReserves(pool, 800e18, 200e18);
         assertEq(pool.previousPrice(), 4_000e18);
+    }
+
+    function test_zeroReadingKeepsBaselineAndReserves() public {
+        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
+        PredictionPool pool = _createPool(address(oracle));
+
+        oracle.setValue(0);
+        pool.rebalance();
+
+        _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
+        assertEq(pool.previousPrice(), 2_000e18);
+
+        // The kept baseline still applies to the next price.
+        oracle.setValue(4_000e18);
+        pool.rebalance();
+        _assertReserves(pool, 800e18, 200e18);
     }
 
     function test_switchToZeroOracleClearsBaseline() public {
         // Switch to Karma before its first submission (the README submits first).
-        PredictionPool pool = _createPool(address(new FixedOracle(1e18)));
+        PredictionPool pool = _createPool(address(new MockPriceOracle(1e18)));
         assertEq(pool.previousPrice(), 1e18);
 
         pool.updateOracle(address(karma));
@@ -174,14 +163,53 @@ contract PoolPriceBaselineTest is Test {
         karma.submitPrice(2_000e18);
         pool.rebalance();
 
-        assertEq(baseToken.balanceOf(address(pool.bullCoin())), HALF);
-        assertEq(baseToken.balanceOf(address(pool.bearCoin())), HALF);
+        _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
         assertEq(pool.previousPrice(), 2_000e18);
+    }
+
+    function test_switchToZeroOracleDropsPendingMove() public {
+        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        PredictionPool pool = _createPool(address(oldOracle));
+        oldOracle.setValue(4_000e18);
+
+        MockPriceOracle newOracle = new MockPriceOracle(0);
+        pool.updateOracle(address(newOracle));
+
+        // A price unlike the old oracle's, so a copied old price would move reserves.
+        newOracle.setValue(3_000e18);
+        pool.rebalance();
+
+        _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
+        assertEq(pool.previousPrice(), 3_000e18);
+    }
+
+    function test_switchToPricedOracleDropsPendingMove() public {
+        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        PredictionPool pool = _createPool(address(oldOracle));
+        oldOracle.setValue(4_000e18);
+
+        pool.updateOracle(address(new MockPriceOracle(4_000e18)));
+        pool.rebalance();
+
+        _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
+        assertEq(pool.previousPrice(), 4_000e18);
+    }
+
+    function test_rebalanceBeforeSwitchKeepsPendingMove() public {
+        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        PredictionPool pool = _createPool(address(oldOracle));
+        oldOracle.setValue(4_000e18);
+
+        pool.rebalance();
+        pool.updateOracle(address(new MockPriceOracle(0)));
+
+        _assertReserves(pool, 800e18, 200e18);
+        assertEq(pool.previousPrice(), 0);
     }
 
     function test_switchToPricedOracleUsesItsPrice() public {
         PredictionPool pool = _createPool(address(karma));
-        address priced = address(new FixedOracle(3_000e18));
+        address priced = address(new MockPriceOracle(3_000e18));
 
         vm.expectEmit(true, true, false, false, address(pool));
         emit PredictionPool.OracleUpdated(address(karma), priced);
@@ -191,27 +219,54 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_resettingSameOracleWhileZeroKeepsBaseline() public {
-        SettableOracle oracle = new SettableOracle(2_000e18);
+        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
         PredictionPool pool = _createPool(address(oracle));
 
-        oracle.set(0);
+        oracle.setValue(0);
         pool.updateOracle(address(oracle));
         assertEq(pool.previousPrice(), 2_000e18);
 
-        oracle.set(4_000e18);
+        oracle.setValue(4_000e18);
         pool.rebalance();
 
-        // The pending 2000 -> 4000 move still applies: bull target = 800.
-        assertEq(baseToken.balanceOf(address(pool.bullCoin())), 800e18);
+        // The pending 2000 -> 4000 move still applies.
+        _assertReserves(pool, 800e18, 200e18);
     }
 
     function test_resettingSameOracleWithPriceUsesItsPrice() public {
-        SettableOracle oracle = new SettableOracle(2_000e18);
+        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
         PredictionPool pool = _createPool(address(oracle));
 
-        oracle.set(3_000e18);
+        oracle.setValue(3_000e18);
         pool.updateOracle(address(oracle));
 
         assertEq(pool.previousPrice(), 3_000e18);
+    }
+
+    function _createPool(address oracle) private returns (PredictionPool) {
+        return PredictionPool(
+            poolFactory.createPool(
+                "Karma market",
+                address(baseToken),
+                oracle,
+                "Bull",
+                "BULL",
+                "Bear",
+                "BEAR",
+                MINT_FEE,
+                BURN_FEE,
+                CREATOR_FEE,
+                DEV_FEE,
+                INITIAL_DEPOSIT
+            )
+        );
+    }
+
+    function _assertReserves(PredictionPool pool, uint256 bullReserve, uint256 bearReserve)
+        private
+        view
+    {
+        assertEq(baseToken.balanceOf(address(pool.bullCoin())), bullReserve);
+        assertEq(baseToken.balanceOf(address(pool.bearCoin())), bearReserve);
     }
 }
