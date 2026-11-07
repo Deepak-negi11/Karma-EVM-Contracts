@@ -84,11 +84,10 @@ contract PoolPriceBaselineTest is Test {
 
         karma.submitPrice(2_000e18);
 
-        vm.prank(trader);
-        uint256 assetOut = bear.sell(coins);
         // Fees are 1.3% each way: 98.7e18 coins at par, then 97.4169e18 back on sell.
         assertEq(coins, 98.7e18);
-        assertEq(assetOut, 97.4169e18);
+        vm.prank(trader);
+        assertEq(bear.sell(coins), 97.4169e18);
         assertEq(pool.previousPrice(), 2_000e18);
     }
 
