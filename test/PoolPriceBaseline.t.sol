@@ -2,43 +2,14 @@
 pragma solidity ^0.8.23;
 
 import { Test } from "forge-std/Test.sol";
-import { Vm } from "forge-std/Vm.sol";
 import { AccumulatorVault } from "../src/AccumulatorVault.sol";
 import { Coin } from "../src/Coin.sol";
 import { Karma } from "../src/Karma.sol";
 import { KarmaAdapterFactory } from "../src/KarmaAdapterFactory.sol";
 import { PredictionPool } from "../src/PredictionPool.sol";
 import { PredictionPoolFactory } from "../src/PredictionPoolFactory.sol";
-import { IOracle } from "../src/interfaces/IOracle.sol";
 import { MockBaseToken } from "./mocks/Mocks.sol";
-
-contract MockPriceOracle is IOracle {
-    uint256 public value;
-
-    constructor(uint256 initialValue) {
-        value = initialValue;
-    }
-
-    function setValue(uint256 newValue) external {
-        value = newValue;
-    }
-
-    function readValue() external view returns (uint256) {
-        return value;
-    }
-
-    function readValueInterval() external view returns (uint256, uint256) {
-        return (value, value);
-    }
-
-    function lastUpdated() external view returns (uint256) {
-        return block.timestamp;
-    }
-
-    function description() external pure returns (string memory) {
-        return "Test oracle";
-    }
-}
+import { MockOracle } from "./PoolSystem.t.sol";
 
 // A pool whose oracle reads 0 must take the first real price as its baseline.
 contract PoolPriceBaselineTest is Test {
@@ -48,8 +19,6 @@ contract PoolPriceBaselineTest is Test {
     uint256 private constant CREATOR_FEE = 500;
     uint256 private constant DEV_FEE = 300;
 
-    address private dev = makeAddr("dev");
-    address private receiver = makeAddr("receiver");
     address private trader = makeAddr("trader");
 
     MockBaseToken private baseToken;
@@ -59,12 +28,14 @@ contract PoolPriceBaselineTest is Test {
 
     function setUp() public {
         baseToken = new MockBaseToken();
-        poolFactory = new PredictionPoolFactory(address(new AccumulatorVault(dev, receiver)));
+        poolFactory = new PredictionPoolFactory(
+            address(new AccumulatorVault(makeAddr("dev"), makeAddr("receiver")))
+        );
         baseToken.mint(address(this), 10 * INITIAL_DEPOSIT);
         baseToken.approve(address(poolFactory), type(uint256).max);
 
         // The source pool gives this contract a balanced position to submit Karma prices with.
-        sourcePool = _createPool(address(new MockPriceOracle(2_500e18)));
+        sourcePool = _createPool(address(new MockOracle(2_500e18)));
         karma = Karma(new KarmaAdapterFactory().createKarma(address(sourcePool), 0, 0, "Karma"));
     }
 
@@ -96,9 +67,8 @@ contract PoolPriceBaselineTest is Test {
 
         vm.recordLogs();
         pool.rebalance();
-        Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        assertEq(logs.length, 0);
+        assertEq(vm.getRecordedLogs().length, 0);
         assertEq(pool.previousPrice(), 2_000e18);
     }
 
@@ -137,7 +107,7 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_zeroReadingKeepsBaselineAndReserves() public {
-        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
+        MockOracle oracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oracle));
 
         oracle.setValue(0);
@@ -154,7 +124,7 @@ contract PoolPriceBaselineTest is Test {
 
     function test_switchToZeroOracleClearsBaseline() public {
         // Switch to Karma before its first submission (the README submits first).
-        PredictionPool pool = _createPool(address(new MockPriceOracle(1e18)));
+        PredictionPool pool = _createPool(address(new MockOracle(1e18)));
         assertEq(pool.previousPrice(), 1e18);
 
         pool.updateOracle(address(karma));
@@ -168,11 +138,11 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_switchToZeroOracleDropsPendingMove() public {
-        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        MockOracle oldOracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oldOracle));
         oldOracle.setValue(4_000e18);
 
-        MockPriceOracle newOracle = new MockPriceOracle(0);
+        MockOracle newOracle = new MockOracle(0);
         pool.updateOracle(address(newOracle));
 
         // A price unlike the old oracle's, so a copied old price would move reserves.
@@ -184,11 +154,11 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_switchToPricedOracleDropsPendingMove() public {
-        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        MockOracle oldOracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oldOracle));
         oldOracle.setValue(4_000e18);
 
-        pool.updateOracle(address(new MockPriceOracle(4_000e18)));
+        pool.updateOracle(address(new MockOracle(4_000e18)));
         pool.rebalance();
 
         _assertReserves(pool, INITIAL_DEPOSIT / 2, INITIAL_DEPOSIT / 2);
@@ -196,12 +166,12 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_rebalanceBeforeSwitchKeepsPendingMove() public {
-        MockPriceOracle oldOracle = new MockPriceOracle(2_000e18);
+        MockOracle oldOracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oldOracle));
         oldOracle.setValue(4_000e18);
 
         pool.rebalance();
-        pool.updateOracle(address(new MockPriceOracle(0)));
+        pool.updateOracle(address(new MockOracle(0)));
 
         _assertReserves(pool, 800e18, 200e18);
         assertEq(pool.previousPrice(), 0);
@@ -209,7 +179,7 @@ contract PoolPriceBaselineTest is Test {
 
     function test_switchToPricedOracleUsesItsPrice() public {
         PredictionPool pool = _createPool(address(karma));
-        address priced = address(new MockPriceOracle(3_000e18));
+        address priced = address(new MockOracle(3_000e18));
 
         vm.expectEmit(true, true, false, false, address(pool));
         emit PredictionPool.OracleUpdated(address(karma), priced);
@@ -219,7 +189,7 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_resettingSameOracleWhileZeroKeepsBaseline() public {
-        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
+        MockOracle oracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oracle));
 
         oracle.setValue(0);
@@ -234,7 +204,7 @@ contract PoolPriceBaselineTest is Test {
     }
 
     function test_resettingSameOracleWithPriceUsesItsPrice() public {
-        MockPriceOracle oracle = new MockPriceOracle(2_000e18);
+        MockOracle oracle = new MockOracle(2_000e18);
         PredictionPool pool = _createPool(address(oracle));
 
         oracle.setValue(3_000e18);
