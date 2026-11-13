@@ -9,7 +9,7 @@ import { PredictionPool } from "../src/PredictionPool.sol";
 import { PredictionPoolFactory } from "../src/PredictionPoolFactory.sol";
 import { MockOracle } from "./PoolSystem.t.sol";
 
-// Base token whose issuer can block an address, like the USDC and USDT blocklists.
+// Base token whose issuer can block an address from receiving, like the USDC blocklist.
 // Some tokens return false instead of reverting, so both ways are covered.
 contract BlockableToken is ERC20 {
     error Blocked();
