@@ -179,7 +179,7 @@ contract Coin is ERC20, ReentrancyGuard {
         if (otherCoin == address(0)) revert MissingOtherCoin();
 
         asset.safeTransferFrom(msg.sender, address(this), amountAsset);
-        _sendFees(vaultAmount, devAmount, creatorAmount);
+        (devAmount, creatorAmount) = _sendFees(vaultAmount, devAmount, creatorAmount);
         _mint(receiver, amountCoin);
 
         cumulativeVolume += amountAsset;
@@ -229,7 +229,7 @@ contract Coin is ERC20, ReentrancyGuard {
         if (amountBeforeFees > asset.balanceOf(address(this))) revert InsufficientReserve();
 
         _burn(msg.sender, amountCoin);
-        _sendFees(vaultAmount, devAmount, creatorAmount);
+        (devAmount, creatorAmount) = _sendFees(vaultAmount, devAmount, creatorAmount);
         asset.safeTransfer(msg.sender, amountAsset);
 
         cumulativeVolume += amountBeforeFees;
@@ -273,10 +273,20 @@ contract Coin is ERC20, ReentrancyGuard {
         creatorAmount = Math.mulDiv(amount, creatorFee, DENOMINATOR, Math.Rounding.Ceil);
     }
 
-    function _sendFees(uint256 vaultAmount, uint256 devAmount, uint256 creatorAmount) internal {
+    // A refused dev or creator fee (for example a blocklisted receiver) must not block buys and
+    // sells. That fee stays in this coin's reserve and the returned amount for it is 0.
+    function _sendFees(uint256 vaultAmount, uint256 devAmount, uint256 creatorAmount)
+        internal
+        returns (uint256 devPaid, uint256 creatorPaid)
+    {
         if (vaultAmount > 0) asset.safeTransfer(otherCoin, vaultAmount);
-        if (devAmount > 0) asset.safeTransfer(accumulatorVault, devAmount);
-        if (creatorAmount > 0) asset.safeTransfer(vaultCreator, creatorAmount);
+        devPaid = _tryPayFee(accumulatorVault, devAmount);
+        creatorPaid = _tryPayFee(vaultCreator, creatorAmount);
+    }
+
+    function _tryPayFee(address receiver, uint256 amount) internal returns (uint256) {
+        if (amount == 0 || !asset.trySafeTransfer(receiver, amount)) return 0;
+        return amount;
     }
 
     function _assetScale() internal view returns (uint256) {
