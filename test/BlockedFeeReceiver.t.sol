@@ -195,7 +195,7 @@ contract BlockedFeeReceiverTest is Test {
         (dev, creatorFee) = _paidFees();
     }
 
-    function _paidFees() private returns (uint256 dev, uint256 creatorFee) {
+    function _paidFees() private view returns (uint256 dev, uint256 creatorFee) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; i++) {
             if (logs[i].topics[0] != Coin.FeeDistribution.selector) continue;
